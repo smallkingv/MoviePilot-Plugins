@@ -1,261 +1,601 @@
-import os
-import subprocess
-import json
-import asyncio
-from typing import Optional, Dict, Any
-from pathlib import Path
+import time
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any, List, Dict, Tuple, Optional
 
-from app.core.event import eventmanager, Event
-from app.schemas.types import EventType
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+
+from app import schemas
+from app.chain.storage import StorageChain
+from app.core.config import settings
+from app.core.event import eventmanager
+from app.db.downloadhistory_oper import DownloadHistoryOper
+from app.db.transferhistory_oper import TransferHistoryOper
 from app.log import logger
 from app.plugins import _PluginBase
+from app.schemas import NotificationType, DownloadHistory
+from app.schemas.types import EventType
 
 
-class AacAudioTrack(_PluginBase):
-    plugin_name = "AAC音轨添加器"
-    plugin_version = "1.0.0"
-    plugin_description = "检测整理后的视频文件，如果没有AAC音轨则自动添加AAC stereo音轨"
-    plugin_author = "Your Name"
-    plugin_icon = "music_note.png"
-    plugin_order = 100
+class AutoClean(_PluginBase):
+    # 插件名称
+    plugin_name = "定时清理媒体库"
+    # 插件描述
+    plugin_desc = "定时清理用户下载的种子、源文件、媒体库文件。"
+    # 插件图标
+    plugin_icon = "clean.png"
+    # 插件版本
+    plugin_version = "2.2"
+    # 插件作者
+    plugin_author = "thsrite"
+    # 作者主页
+    author_url = "https://github.com/thsrite"
+    # 插件配置项ID前缀
+    plugin_config_prefix = "autoclean_"
+    # 加载顺序
+    plugin_order = 23
+    # 可使用的用户级别
+    auth_level = 2
 
-    def init_plugin(self, config: Optional[Dict[str, Any]] = None):
-        self._config = config or {}
-        self._enabled = self._config.get("enabled", False)
-        self._watch_paths = self._config.get("watch_paths", [])
-        self._ffmpeg_path = self._config.get("ffmpeg_path", "ffmpeg")
-        self._aac_bitrate = self._config.get("aac_bitrate", "192k")
-        self._processed_files = set()
-        
+    # 私有属性
+    _enabled = False
+    # 任务执行间隔
+    _cron = None
+    _type = None
+    _onlyonce = False
+    _notify = False
+    _cleantype = None
+    _cleandate = None
+    _cleanuser = None
+
+    # 定时器
+    _scheduler: Optional[BackgroundScheduler] = None
+
+    def init_plugin(self, config: dict = None):
+        # 停止现有任务
+        self.stop_service()
+
+        if config:
+            self._enabled = config.get("enabled")
+            self._cron = config.get("cron")
+            self._onlyonce = config.get("onlyonce")
+            self._notify = config.get("notify")
+            self._cleantype = config.get("cleantype")
+            self._cleandate = config.get("cleandate")
+            self._cleanuser = config.get("cleanuser")
+
+            # 加载模块
         if self._enabled:
-            logger.info(f"{self.plugin_name} 插件已启用")
-            logger.info(f"监控路径: {self._watch_paths}")
+            if self._onlyonce:
+                # 定时服务
+                self._scheduler = BackgroundScheduler(timezone=settings.TZ)
+                logger.info(f"定时清理媒体库服务启动，立即运行一次")
+                self._scheduler.add_job(func=self.__clean, trigger='date',
+                                        run_date=datetime.now(tz=pytz.timezone(settings.TZ)) + timedelta(seconds=3),
+                                        name="定时清理媒体库")
+                # 关闭一次性开关
+                self._onlyonce = False
+                self.update_config({
+                    "onlyonce": False,
+                    "cron": self._cron,
+                    "cleantype": self._cleantype,
+                    "cleandate": self._cleandate,
+                    "enabled": self._enabled,
+                    "cleanuser": self._cleanuser,
+                    "notify": self._notify,
+                })
+
+                # 启动任务
+                if self._scheduler.get_jobs():
+                    self._scheduler.print_jobs()
+                    self._scheduler.start()
+
+    def __get_clean_date(self, deltatime: str = None):
+        # 清理日期
+        current_time = datetime.now()
+        if deltatime:
+            days_ago = current_time - timedelta(days=int(deltatime))
         else:
-            logger.info(f"{self.plugin_name} 插件未启用")
+            days_ago = current_time - timedelta(days=int(self._cleandate))
+        return days_ago.strftime("%Y-%m-%d")
+
+    def __clean(self):
+        """
+        定时清理媒体库
+        """
+        if not self._cleandate:
+            logger.error("未配置媒体库全局清理时间，停止运行")
+            return
+
+        # 查询用户清理日期之前的下载历史，不填默认清理全部用户的下载
+        _downloadhis = DownloadHistoryOper()
+        if not self._cleanuser:
+            clean_date = self.__get_clean_date()
+            downloadhis_list = _downloadhis.list_by_user_date(date=clean_date)
+            logger.info(f'获取到日期 {clean_date} 之前的下载历史 {len(downloadhis_list)} 条')
+            self.__clean_history(date=clean_date, clean_type=self._cleantype, downloadhis_list=downloadhis_list)
+
+        # 根据填写的信息判断怎么清理
+        else:
+            # 1.3.7版本及之前处理多位用户
+            if str(self._cleanuser).count(','):
+                for username in str(self._cleanuser).split(","):
+                    downloadhis_list = _downloadhis.list_by_user_date(date=self._cleandate,
+                                                                      username=username)
+                    logger.info(
+                        f'获取到用户 {username} 日期 {self._cleandate} 之前的下载历史 {len(downloadhis_list)} 条')
+                    self.__clean_history(date=self._cleandate, clean_type=self._cleantype, downloadhis_list=downloadhis_list)
+                return
+
+            for userinfo in str(self._cleanuser).split("\n"):
+                # username:days#cleantype
+                clean_type = self._cleantype
+                days = self._cleandate
+                if userinfo.count('#'):
+                    clean_type = userinfo.split('#')[1]
+                    username_and_days = userinfo.split('#')[0]
+                else:
+                    username_and_days = userinfo
+                if username_and_days.count(':'):
+                    days = username_and_days.split(':')[1]
+                    username = username_and_days.split(':')[0]
+                else:
+                    username = userinfo
+
+                # 转strftime
+                clean_date = self.__get_clean_date(days)
+                logger.info(f'{username} 使用 {clean_type} 清理方式，清理 {clean_date} 之前的下载历史')
+                downloadhis_list = _downloadhis.list_by_user_date(date=clean_date,
+                                                                  username=username)
+                logger.info(
+                    f'获取到用户 {username} 日期 {clean_date} 之前的下载历史 {len(downloadhis_list)} 条')
+                self.__clean_history(date=clean_date, clean_type=clean_type,
+                                     downloadhis_list=downloadhis_list)
+
+    def __clean_history(self, date: str, clean_type: str, downloadhis_list: List[DownloadHistory]):
+        """
+        清理下载历史、转移记录
+        """
+        if not downloadhis_list:
+            logger.warn(f"未获取到日期 {date} 之前的下载记录，停止运行")
+            return
+
+        # 读取历史记录
+        _transferhis = TransferHistoryOper()
+        pulgin_history = self.get_data('history') or []
+
+        # 创建一个字典来保存分组结果
+        downloadhis_grouped_dict: Dict[tuple, List[DownloadHistory]] = defaultdict(list)
+        # 遍历DownloadHistory对象列表
+        for downloadhis in downloadhis_list:
+            # 获取type和tmdbid的值
+            dtype = downloadhis.type
+            tmdbid = downloadhis.tmdbid
+
+            # 将DownloadHistory对象添加到对应分组的列表中
+            downloadhis_grouped_dict[(dtype, tmdbid)].append(downloadhis)
+
+        # 输出分组结果
+        for key, downloadhis_list in downloadhis_grouped_dict.items():
+            logger.info(f"开始清理 {key}")
+            del_transferhis_cnt = 0
+            del_media_name = downloadhis_list[0].title
+            del_media_user = downloadhis_list[0].username
+            del_media_type = downloadhis_list[0].type
+            del_media_year = downloadhis_list[0].year
+            del_media_season = downloadhis_list[0].seasons
+            del_media_episode = downloadhis_list[0].episodes
+            del_image = downloadhis_list[0].image
+            for downloadhis in downloadhis_list:
+                if not downloadhis.download_hash:
+                    logger.debug(f'下载历史 {downloadhis.id} {downloadhis.title} 未获取到download_hash，跳过处理')
+                    continue
+                # 根据hash获取转移记录
+                transferhis_list = _transferhis.list_by_hash(download_hash=downloadhis.download_hash)
+                if not transferhis_list:
+                    logger.warn(f"下载历史 {downloadhis.download_hash} 未查询到转移记录，跳过处理")
+                    continue
+
+                for history in transferhis_list:
+                    # 册除媒体库文件
+                    if clean_type in ["dest", "all"]:
+                        dest_fileitem = schemas.FileItem(**history.dest_fileitem)
+                        StorageChain().delete_file(dest_fileitem)
+                        # 删除记录
+                        _transferhis.delete(history.id)
+                    # 删除源文件
+                    if clean_type in ["src", "all"]:
+                        src_fileitem = schemas.FileItem(**history.src_fileitem)
+                        StorageChain().delete_file(src_fileitem)
+                        # 发送事件
+                        eventmanager.send_event(
+                            EventType.DownloadFileDeleted,
+                            {
+                                "src": history.src
+                            }
+                        )
+
+                # 累加删除数量
+                del_transferhis_cnt += len(transferhis_list)
+
+            if del_transferhis_cnt:
+                # 发送消息
+                if self._notify:
+                    self.post_message(
+                        mtype=NotificationType.MediaServer,
+                        title="【定时清理媒体库任务完成】",
+                        text=f"清理媒体名称 {del_media_name}\n"
+                             f"下载媒体用户 {del_media_user}\n"
+                             f"删除历史记录 {del_transferhis_cnt}")
+
+                pulgin_history.append({
+                    "type": del_media_type,
+                    "title": del_media_name,
+                    "year": del_media_year,
+                    "season": del_media_season,
+                    "episode": del_media_episode,
+                    "image": del_image,
+                    "del_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time()))
+                })
+
+        # 保存历史
+        self.save_data("history", pulgin_history)
 
     def get_state(self) -> bool:
         return self._enabled
 
     @staticmethod
-    def get_command() -> Optional[Dict[str, Any]]:
+    def get_command() -> List[Dict[str, Any]]:
         pass
 
-    def get_api(self) -> Optional[Dict[str, Any]]:
+    def get_api(self) -> List[Dict[str, Any]]:
         pass
 
-    def get_form(self) -> Optional[Dict[str, Any]]:
-        return {
-            "enabled": {
-                "title": "启用插件",
-                "required": False,
-                "type": "switch",
-                "default": False
-            },
-            "watch_paths": {
-                "title": "监控路径",
-                "required": True,
-                "type": "list-string",
-                "default": [],
-                "tooltip": "需要监控的视频文件目录，支持多个路径"
-            },
-            "ffmpeg_path": {
-                "title": "FFmpeg路径",
-                "required": False,
-                "type": "string",
-                "default": "ffmpeg",
-                "tooltip": "FFmpeg可执行文件路径，默认使用系统PATH中的ffmpeg"
-            },
-            "aac_bitrate": {
-                "title": "AAC比特率",
-                "required": False,
-                "type": "string",
-                "default": "192k",
-                "tooltip": "AAC音轨的比特率，如128k、192k、256k等"
+    def get_service(self) -> List[Dict[str, Any]]:
+        """
+        注册插件公共服务
+        [{
+            "id": "服务ID",
+            "name": "服务名称",
+            "trigger": "触发器：cron/interval/date/CronTrigger.from_crontab()",
+            "func": self.xxx,
+            "kwargs": {} # 定时器参数
+        }]
+        """
+        if self._enabled and self._cron:
+            return [
+                {
+                    "id": "AutoClean",
+                    "name": "清理媒体库定时服务",
+                    "trigger": CronTrigger.from_crontab(self._cron),
+                    "func": self.__clean,
+                    "kwargs": {}
+                }
+            ]
+
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """
+        拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构
+        """
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enabled',
+                                            'label': '启用插件',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'onlyonce',
+                                            'label': '立即运行一次',
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'notify',
+                                            'label': '开启通知',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VCronField',
+                                        'props': {
+                                            'model': 'cron',
+                                            'label': '执行周期',
+                                            'placeholder': '0 0 ? ? ?'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSelect',
+                                        'props': {
+                                            'model': 'cleantype',
+                                            'label': '全局清理方式',
+                                            'items': [
+                                                {'title': '媒体库文件', 'value': 'dest'},
+                                                {'title': '源文件', 'value': 'src'},
+                                                {'title': '所有文件', 'value': 'all'},
+                                            ]
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 4
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'cleandate',
+                                            'label': '全局清理日期',
+                                            'placeholder': '清理多少天之前的下载记录（天）'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'cleanuser',
+                                            'label': '清理配置',
+                                            'rows': 6,
+                                            'placeholder': '每一行一个配置，支持以下几种配置方式，清理方式支持 src、desc、all 分别对应源文件，媒体库文件，所有文件\n'
+                                                           '用户名缺省默认清理所有用户(慎重留空)，清理天数缺省默认使用全局清理天数，清理方式缺省默认使用全局清理方式\n'
+                                                           '用户名/插件名（豆瓣想看、豆瓣榜单、RSS订阅）\n'
+                                                           '用户名#清理方式\n'
+                                                           '用户名:清理天数\n'
+                                                           '用户名:清理天数#清理方式',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
             }
+        ], {
+            "enabled": False,
+            "onlyonce": False,
+            "notify": False,
+            "cleantype": "dest",
+            "cron": "",
+            "cleanuser": "",
+            "cleandate": 30
         }
 
+    def get_page(self) -> List[dict]:
+        """
+        拼装插件详情页面，需要返回页面配置，同时附带数据
+        """
+        # 查询同步详情
+        historys = self.get_data('history')
+        if not historys:
+            return [
+                {
+                    'component': 'div',
+                    'text': '暂无数据',
+                    'props': {
+                        'class': 'text-center',
+                    }
+                }
+            ]
+        # 数据按时间降序排序
+        historys = sorted(historys, key=lambda x: x.get('del_time'), reverse=True)
+        # 拼装页面
+        contents = []
+        for history in historys:
+            htype = history.get("type")
+            title = history.get("title")
+            year = history.get("year")
+            season = history.get("season")
+            episode = history.get("episode")
+            image = history.get("image")
+            del_time = history.get("del_time")
+
+            if season:
+                sub_contents = [
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'类型：{htype}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'标题：{title}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'年份：{year}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'季：{season}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'集：{episode}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'时间：{del_time}'
+                    }
+                ]
+            else:
+                sub_contents = [
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'类型：{htype}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'标题：{title}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'年份：{year}'
+                    },
+                    {
+                        'component': 'VCardText',
+                        'props': {
+                            'class': 'pa-0 px-2'
+                        },
+                        'text': f'时间：{del_time}'
+                    }
+                ]
+
+            contents.append(
+                {
+                    'component': 'VCard',
+                    'content': [
+                        {
+                            'component': 'div',
+                            'props': {
+                                'class': 'd-flex justify-space-start flex-nowrap flex-row',
+                            },
+                            'content': [
+                                {
+                                    'component': 'div',
+                                    'content': [
+                                        {
+                                            'component': 'VImg',
+                                            'props': {
+                                                'src': image,
+                                                'height': 120,
+                                                'width': 80,
+                                                'aspect-ratio': '2/3',
+                                                'class': 'object-cover shadow ring-gray-500',
+                                                'cover': True
+                                            }
+                                        }
+                                    ]
+                                },
+                                {
+                                    'component': 'div',
+                                    'content': sub_contents
+                                }
+                            ]
+                        }
+                    ]
+                }
+            )
+
+        return [
+            {
+                'component': 'div',
+                'props': {
+                    'class': 'grid gap-3 grid-info-card',
+                },
+                'content': contents
+            }
+        ]
+
     def stop_service(self):
-        pass
-
-    def _is_video_file(self, filepath: str) -> bool:
-        video_extensions = {'.mp4', '.mkv', '.avi', '.mov', '.flv', '.wmv', '.webm', '.m4v'}
-        return Path(filepath).suffix.lower() in video_extensions
-
-    def _check_aac_audio(self, filepath: str) -> bool:
+        """
+        退出插件
+        """
         try:
-            cmd = [
-                self._ffmpeg_path,
-                '-i', filepath,
-                '-hide_banner',
-                '-loglevel', 'error',
-                '-select_streams', 'a',
-                '-show_entries', 'stream=codec_name',
-                '-of', 'json',
-                '-'
-            ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"获取音轨信息失败: {filepath}")
-                return False
-            
-            try:
-                streams_info = json.loads(result.stdout)
-                streams = streams_info.get('streams', [])
-                
-                for stream in streams:
-                    codec_name = stream.get('codec_name', '').lower()
-                    if 'aac' in codec_name:
-                        logger.info(f"视频已包含AAC音轨: {filepath}")
-                        return True
-                
-                return False
-            except json.JSONDecodeError:
-                logger.error(f"解析音轨信息JSON失败: {filepath}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            logger.error(f"获取音轨信息超时: {filepath}")
-            return False
+            if self._scheduler:
+                self._scheduler.remove_all_jobs()
+                if self._scheduler.running:
+                    self._scheduler.shutdown()
+                self._scheduler = None
         except Exception as e:
-            logger.error(f"检查AAC音轨时发生错误: {filepath}, 错误: {str(e)}")
-            return False
-
-    def _add_aac_audio(self, filepath: str) -> bool:
-        try:
-            temp_file = filepath + '.temp'
-            
-            cmd = [
-                self._ffmpeg_path,
-                '-i', filepath,
-                '-c:v', 'copy',
-                '-c:a', 'aac',
-                '-b:a', self._aac_bitrate,
-                '-ac', '2',
-                '-map', '0:v',
-                '-map', '0:a?',
-                '-c:s', 'copy',
-                '-map', '0:s?',
-                '-y',
-                temp_file
-            ]
-            
-            logger.info(f"开始添加AAC音轨: {filepath}")
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=3600
-            )
-            
-            if result.returncode != 0:
-                logger.error(f"添加AAC音轨失败: {filepath}")
-                logger.error(f"错误信息: {result.stderr}")
-                return False
-            
-            if os.path.exists(temp_file):
-                original_size = os.path.getsize(filepath)
-                new_size = os.path.getsize(temp_file)
-                
-                os.remove(filepath)
-                os.rename(temp_file, filepath)
-                
-                logger.info(f"成功添加AAC音轨: {filepath}")
-                logger.info(f"文件大小变化: {original_size / (1024*1024):.2f}MB -> {new_size / (1024*1024):.2f}MB")
-                return True
-            else:
-                logger.error(f"临时文件未创建: {temp_file}")
-                return False
-                
-        except subprocess.TimeoutExpired:
-            logger.error(f"添加AAC音轨超时: {filepath}")
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            return False
-        except Exception as e:
-            logger.error(f"添加AAC音轨时发生错误: {filepath}, 错误: {str(e)}")
-            if os.path.exists(temp_file):
-                os.remove(temp_file)
-            return False
-
-    def _process_video_file(self, filepath: str):
-        if not self._enabled:
-            return
-        
-        if filepath in self._processed_files:
-            return
-        
-        if not self._is_video_file(filepath):
-            return
-        
-        if not os.path.exists(filepath):
-            logger.warning(f"文件不存在: {filepath}")
-            return
-        
-        logger.info(f"开始处理视频文件: {filepath}")
-        
-        if self._check_aac_audio(filepath):
-            self._processed_files.add(filepath)
-            return
-        
-        if self._add_aac_audio(filepath):
-            self._processed_files.add(filepath)
-        else:
-            logger.error(f"处理失败: {filepath}")
-
-    def _scan_directory(self, directory: str):
-        try:
-            for root, dirs, files in os.walk(directory):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    self._process_video_file(filepath)
-        except Exception as e:
-            logger.error(f"扫描目录时发生错误: {directory}, 错误: {str(e)}")
-
-    @eventmanager.register(EventType.TransferComplete)
-    async def handle_transfer_complete(self, event: Event):
-        if not self._enabled:
-            return
-        
-        event_data = event.event_data
-        logger.info(f"收到转移完成事件: {event_data}")
-        
-        transfer_path = event_data.get('path', '')
-        target_path = event_data.get('target_path', '')
-        
-        paths_to_scan = []
-        if transfer_path and os.path.exists(transfer_path):
-            paths_to_scan.append(transfer_path)
-        if target_path and os.path.exists(target_path):
-            paths_to_scan.append(target_path)
-        
-        for path in paths_to_scan:
-            if os.path.isfile(path):
-                self._process_video_file(path)
-            elif os.path.isdir(path):
-                self._scan_directory(path)
-
-    async def manual_scan(self):
-        if not self._enabled:
-            logger.warning("插件未启用，无法执行手动扫描")
-            return
-        
-        logger.info("开始手动扫描监控路径")
-        
-        for watch_path in self._watch_paths:
-            if os.path.exists(watch_path):
-                if os.path.isfile(watch_path):
-                    self._process_video_file(watch_path)
-                elif os.path.isdir(watch_path):
-                    self._scan_directory(watch_path)
-            else:
-                logger.warning(f"监控路径不存在: {watch_path}")
-        
-        logger.info("手动扫描完成")
+            logger.error("退出插件失败：%s" % str(e))
