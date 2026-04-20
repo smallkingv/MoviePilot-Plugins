@@ -5,7 +5,7 @@ from pathlib import Path
 import subprocess
 import json
 import re
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,76 @@ class AudioTrackConverter(_PluginBase):
                 if d.strip()
             ]
             logger.info(f"插件初始化完成，监控目录: {self._watch_dirs}")
+    
+    def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """配置表单"""
+        return [
+            {
+                'component': 'VForm',
+                'content': [
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12, 'md': 4},
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'enabled',
+                                            'label': '启用插件',
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VTextarea',
+                                        'props': {
+                                            'model': 'watch_dirs',
+                                            'label': '监控目录',
+                                            'placeholder': '每行一个目录路径，例如：\n/volume1/video/movies\n/volume1/video/tvshows',
+                                            'rows': 4,
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': '提示：需要安装ffmpeg和ffprobe，并添加到系统PATH环境变量中。'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ], {
+            "enabled": False,
+            "watch_dirs": "",
+        }
     
     def get_state(self) -> bool:
         """获取插件状态"""
