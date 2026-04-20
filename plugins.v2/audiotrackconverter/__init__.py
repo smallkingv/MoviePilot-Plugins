@@ -115,6 +115,95 @@ class AudioTrackConverter(_PluginBase):
         """获取插件状态"""
         return self._enabled
     
+    def get_api(self) -> List[Dict[str, Any]]:
+        """注册API接口"""
+        return []
+    
+    def get_page(self) -> List[dict]:
+        """插件状态页面"""
+        return [
+            {
+                'component': 'div',
+                'content': [
+                    {
+                        'component': 'div',
+                        'props': {
+                            'class': 'text-center'
+                        },
+                        'content': [
+                            {
+                                'component': 'span',
+                                'props': {
+                                    'class': 'text-h6',
+                                },
+                                'text': '音频轨道转换器'
+                            },
+                            {
+                                'component': 'VChip',
+                                'props': {
+                                    'class': 'ml-2',
+                                    'color': 'success' if self._enabled else 'error',
+                                    'text': '已启用' if self._enabled else '未启用'
+                                }
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VAlert',
+                        'props': {
+                            'type': 'info',
+                            'variant': 'tonal',
+                            'text': '监控视频目录，自动将EAC3/AC3单音轨转换为AAC外挂音轨',
+                            'class': 'mt-4'
+                        }
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {
+                            'class': 'mt-4'
+                        },
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {'cols': 12},
+                                'content': [
+                                    {
+                                        'component': 'VAlert',
+                                        'props': {
+                                            'type': 'info',
+                                            'variant': 'tonal',
+                                            'text': f'监控目录：{len(self._watch_dirs)} 个'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]
+    
+    def get_service(self) -> List[Dict[str, Any]]:
+        """注册定时服务"""
+        return [
+            {
+                "id": "audio_convert_scan",
+                "name": "音频转换扫描",
+                "trigger": "interval",
+                "trigger_type": "interval",
+                "scheduler": {
+                    "minutes": 30
+                },
+                "func": self._scan_all_directories,
+                "kwargs": {}
+            }
+        ]
+    
+    def stop_service(self):
+        """停止服务"""
+        logger.info("音频轨道转换器插件已停止")
+        self._enabled = False
+    
     def get_command(self) -> List[Dict[str, Any]]:
         """注册命令"""
         return [{
@@ -165,9 +254,9 @@ class AudioTrackConverter(_PluginBase):
             return
         
         logger.info("收到手动扫描请求")
-        self._scan_directories()
+        self._scan_all_directories()
     
-    def _scan_directories(self):
+    def _scan_all_directories(self):
         """扫描监控目录"""
         if not self._enabled or not self._watch_dirs:
             return
