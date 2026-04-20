@@ -187,17 +187,17 @@ class AudioTrackConverter(_PluginBase):
     
     def get_service(self) -> List[Dict[str, Any]]:
         """注册定时服务"""
+        if not self.get_state():
+            return []
         return [
             {
                 "id": "audio_convert_scan",
                 "name": "音频转换扫描",
                 "trigger": "interval",
-                "trigger_type": "interval",
-                "scheduler": {
-                    "minutes": 30
-                },
                 "func": self._scan_all_directories,
-                "kwargs": {}
+                "kwargs": {
+                    "minutes": 30
+                }
             }
         ]
     
@@ -206,7 +206,8 @@ class AudioTrackConverter(_PluginBase):
         logger.info("音频轨道转换器插件已停止")
         self._enabled = False
     
-    def get_command(self) -> List[Dict[str, Any]]:
+    @staticmethod
+    def get_command() -> List[Dict[str, Any]]:
         """注册命令"""
         return [{
             "cmd": "/audio_convert_scan",
