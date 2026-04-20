@@ -20,6 +20,8 @@ class AudioTrackConverter(_PluginBase):
     plugin_desc = "监控视频目录，将EAC3/AC3单音轨转换为AAC立体声外挂音轨"
     plugin_icon = "/volume1/docker/movie/icons/Audiobookshelf_A.png"
     plugin_order = 100
+    # 插件配置项ID前缀
+    plugin_config_prefix = "audiotrackconverter_"
     
     def __init__(self):
         super().__init__()
@@ -43,7 +45,7 @@ class AudioTrackConverter(_PluginBase):
     
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """拼装插件配置页面，需要返回两块数据：1、页面配置；2、数据结构"""
-        return ([
+        return [
             {
                 'component': 'VForm',
                 'content': [
@@ -109,7 +111,7 @@ class AudioTrackConverter(_PluginBase):
         ], {
             "enabled": False,
             "watch_dirs": "",
-        })
+        }
     
     def get_state(self) -> bool:
         """获取插件状态"""
